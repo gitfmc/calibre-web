@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 #  This file is part of the Calibre-Web (https://github.com/janeczku/calibre-web)
@@ -17,24 +16,58 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-try:
-    from pydrive.auth import GoogleAuth
-    from pydrive.drive import GoogleDrive
-    from pydrive.auth import RefreshError, InvalidConfigError
-    from apiclient import errors
-    gdrive_support = True
-except ImportError:
-    gdrive_support = False
-
+from __future__ import division, print_function, unicode_literals
 import os
-from ub import config
-import cli
+import json
 import shutil
+import chardet
+import ssl
+
 from flask import Response, stream_with_context
-from sqlalchemy import *
+from sqlalchemy import create_engine
+from sqlalchemy import Column, UniqueConstraint
+from sqlalchemy import String, Integer
+from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import *
-import web
+from sqlalchemy.exc import OperationalError, InvalidRequestError
+
+try:
+    from apiclient import errors
+    from httplib2 import ServerNotFoundError
+    importError = None
+    gdrive_support = True
+except ImportError as e:
+    importError = e
+    gdrive_support = False
+try:
+    from pydrive2.auth import GoogleAuth
+    from pydrive2.drive import GoogleDrive
+    from pydrive2.auth import RefreshError
+except ImportError as err:
+    try:
+        from pydrive.auth import GoogleAuth
+        from pydrive.drive import GoogleDrive
+        from pydrive.auth import RefreshError
+    except ImportError as err:
+        importError = err
+        gdrive_support = False
+
+from . import logger, cli, config
+from .constants import CONFIG_DIR as _CONFIG_DIR
+
+
+SETTINGS_YAML  = os.path.join(_CONFIG_DIR, 'settings.yaml')
+CREDENTIALS    = os.path.join(_CONFIG_DIR, 'gdrive_credentials')
+CLIENT_SECRETS = os.path.join(_CONFIG_DIR, 'client_secrets.json')
+
+log = logger.create()
+if gdrive_support:
+    logger.get('googleapiclient.discovery_cache').setLevel(logger.logging.ERROR)
+    if not logger.is_debug_enabled():
+        logger.get('googleapiclient.discovery').setLevel(logger.logging.ERROR)
+else:
+    log.debug("Cannot import pydrive,httplib2, using gdrive will not work: %s", importError)
+
 
 class Singleton:
     """
@@ -67,6 +100,9 @@ class Singleton:
         except AttributeError:
             self._instance = self._decorated()
             return self._instance
+        except (ImportError, NameError) as e:
+            log.debug(e)
+            return None
 
     def __call__(self):
         raise TypeError('Singletons must be accessed through `Instance()`.')
@@ -78,13 +114,20 @@ class Singleton:
 @Singleton
 class Gauth:
     def __init__(self):
-        self.auth = GoogleAuth(settings_file=os.path.join(config.get_main_dir,'settings.yaml'))
+        try:
+            self.auth = GoogleAuth(settings_file=SETTINGS_YAML)
+        except NameError as error:
+            log.error(error)
+            self.auth = None
 
 
 @Singleton
 class Gdrive:
     def __init__(self):
         self.drive = getDrive(gauth=Gauth.Instance().auth)
+
+def is_gdrive_ready():
+    return os.path.exists(SETTINGS_YAML) and os.path.exists(CREDENTIALS)
 
 
 engine = create_engine('sqlite:///{0}'.format(cli.gdpath), echo=False)
@@ -146,17 +189,17 @@ migrate()
 def getDrive(drive=None, gauth=None):
     if not drive:
         if not gauth:
-            gauth = GoogleAuth(settings_file=os.path.join(config.get_main_dir,'settings.yaml'))
+            gauth = GoogleAuth(settings_file=SETTINGS_YAML)
         # Try to load saved client credentials
-        gauth.LoadCredentialsFile(os.path.join(config.get_main_dir,'gdrive_credentials'))
+        gauth.LoadCredentialsFile(CREDENTIALS)
         if gauth.access_token_expired:
             # Refresh them if expired
             try:
                 gauth.Refresh()
             except RefreshError as e:
-                web.app.logger.error("Google Drive error: " + e.message)
+                log.error("Google Drive error: %s", e)
             except Exception as e:
-                web.app.logger.exception(e)
+                log.debug_or_exception(e)
         else:
             # Initialize the saved creds
             gauth.Authorize()
@@ -166,18 +209,22 @@ def getDrive(drive=None, gauth=None):
         try:
             drive.auth.Refresh()
         except RefreshError as e:
-            web.app.logger.error("Google Drive error: " + e.message)
+            log.error("Google Drive error: %s", e)
     return drive
 
 def listRootFolders():
-    drive = getDrive(Gdrive.Instance().drive)
-    folder = "'root' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    fileList = drive.ListFile({'q': folder}).GetList()
+    try:
+        drive = getDrive(Gdrive.Instance().drive)
+        folder = "'root' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        fileList = drive.ListFile({'q': folder}).GetList()
+    except (ServerNotFoundError, ssl.SSLError) as e:
+        log.info("GDrive Error %s" % e)
+        fileList = []
     return fileList
 
 
 def getEbooksFolder(drive):
-    return getFolderInFolder('root',config.config_google_drive_folder,drive)
+    return getFolderInFolder('root', config.config_google_drive_folder, drive)
 
 
 def getFolderInFolder(parentId, folderName, drive):
@@ -203,11 +250,11 @@ def getEbooksFolderId(drive=None):
         try:
             gDriveId.gdrive_id = getEbooksFolder(drive)['id']
         except Exception:
-            web.app.logger.error('Error gDrive, root ID not found')
+            log.error('Error gDrive, root ID not found')
         gDriveId.path = '/'
         session.merge(gDriveId)
         session.commit()
-        return
+        return gDriveId.gdrive_id
 
 
 def getFile(pathId, fileName, drive):
@@ -347,7 +394,8 @@ def uploadFileToEbooksFolder(destFile, f):
             if len(existingFiles) > 0:
                 driveFile = existingFiles[0]
             else:
-                driveFile = drive.CreateFile({'title': x, 'parents': [{"kind": "drive#fileLink", 'id': parent['id']}],})
+                driveFile = drive.CreateFile({'title': x,
+                                              'parents': [{"kind": "drive#fileLink", 'id': parent['id']}], })
             driveFile.SetContentFile(f)
             driveFile.Upload()
         else:
@@ -443,17 +491,22 @@ def getChangeById (drive, change_id):
         change = drive.auth.service.changes().get(changeId=change_id).execute()
         return change
     except (errors.HttpError) as error:
-        web.app.logger.info(error.message)
+        log.error(error)
         return None
     except Exception as e:
-        web.app.logger.info(e)
+        log.error(e)
         return None
 
 
 # Deletes the local hashes database to force search for new folder names
 def deleteDatabaseOnChange():
-    session.query(GdriveId).delete()
-    session.commit()
+    try:
+        session.query(GdriveId).delete()
+        session.commit()
+    except (OperationalError, InvalidRequestError):
+        session.rollback()
+        log.info(u"GDrive DB is not Writeable")
+
 
 def updateGdriveCalibreFromLocal():
     copyToDrive(Gdrive.Instance().drive, config.config_calibre_dir, False, True)
@@ -504,18 +557,75 @@ def partial(total_byte_len, part_size_limit):
     return s
 
 # downloads files in chunks from gdrive
-def do_gdrive_download(df, headers):
+def do_gdrive_download(df, headers, convert_encoding=False):
     total_size = int(df.metadata.get('fileSize'))
     download_url = df.metadata.get('downloadUrl')
     s = partial(total_size, 1024 * 1024)  # I'm downloading BIG files, so 100M chunk size is fine for me
 
-    def stream():
+    def stream(convert_encoding):
         for byte in s:
             headers = {"Range": 'bytes=%s-%s' % (byte[0], byte[1])}
             resp, content = df.auth.Get_Http_Object().request(download_url, headers=headers)
             if resp.status == 206:
+                if convert_encoding:
+                    result = chardet.detect(content)
+                    content = content.decode(result['encoding']).encode('utf-8')
                 yield content
             else:
-                web.app.logger.info('An error occurred: %s' % resp)
+                log.warning('An error occurred: %s', resp)
                 return
-    return Response(stream_with_context(stream()), headers=headers)
+    return Response(stream_with_context(stream(convert_encoding)), headers=headers)
+
+
+_SETTINGS_YAML_TEMPLATE = """
+client_config_backend: settings
+client_config_file: %(client_file)s
+client_config:
+  client_id: %(client_id)s
+  client_secret: %(client_secret)s
+  redirect_uri: %(redirect_uri)s
+
+save_credentials: True
+save_credentials_backend: file
+save_credentials_file: %(credential)s
+
+get_refresh_token: True
+
+oauth_scope:
+  - https://www.googleapis.com/auth/drive
+"""
+
+def update_settings(client_id, client_secret, redirect_uri):
+    if redirect_uri.endswith('/'):
+        redirect_uri = redirect_uri[:-1]
+    config_params = {
+                        'client_file': CLIENT_SECRETS,
+                        'client_id': client_id,
+                        'client_secret': client_secret,
+                        'redirect_uri': redirect_uri,
+                        'credential': CREDENTIALS
+                    }
+
+    with open(SETTINGS_YAML, 'w') as f:
+        f.write(_SETTINGS_YAML_TEMPLATE % config_params)
+
+
+def get_error_text(client_secrets=None):
+    if not gdrive_support:
+        return 'Import of optional Google Drive requirements missing'
+
+    if not os.path.isfile(CLIENT_SECRETS):
+        return 'client_secrets.json is missing or not readable'
+
+    try:
+        with open(CLIENT_SECRETS, 'r') as settings:
+            filedata = json.load(settings)
+    except PermissionError:
+        return 'client_secrets.json is missing or not readable'
+
+    if 'web' not in filedata:
+        return 'client_secrets.json is not configured for web application'
+    if 'redirect_uris' not in filedata['web']:
+        return 'Callback url (redirect url) is missing in client_secrets.json'
+    if client_secrets:
+        client_secrets.update(filedata['web'])

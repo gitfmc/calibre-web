@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 #  This file is part of the Calibre-Web (https://github.com/janeczku/calibre-web)
@@ -17,51 +16,47 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-
+from __future__ import division, print_function, unicode_literals
 import os
-import subprocess
-import ub
 import re
 from flask_babel import gettext as _
 
+from . import config, logger
+from .subproc_wrapper import process_wait
 
-def versionKindle():
-    versions = _(u'not installed')
-    if os.path.exists(ub.config.config_converterpath):
+
+log = logger.create()
+
+# _() necessary to make babel aware of string for translation
+_NOT_CONFIGURED = _('not configured')
+_NOT_INSTALLED = _('not installed')
+_EXECUTION_ERROR = _('Execution permissions missing')
+
+
+def _get_command_version(path, pattern, argument=None):
+    if os.path.exists(path):
+        command = [path]
+        if argument:
+            command.append(argument)
         try:
-            p = subprocess.Popen(ub.config.config_converterpath, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            p.wait()
-            for lines in p.stdout.readlines():
-                if isinstance(lines, bytes):
-                    lines = lines.decode('utf-8')
-                if re.search('Amazon kindlegen\(', lines):
-                    versions = lines
-        except Exception:
-            versions = _(u'Excecution permissions missing')
-    return {'kindlegen' : versions}
+            for line in process_wait(command):
+                if re.search(pattern, line):
+                    return line
+        except Exception as ex:
+            log.warning("%s: %s", path, ex)
+            return _EXECUTION_ERROR
+    return _NOT_INSTALLED
 
 
-def versionCalibre():
-    versions = _(u'not installed')
-    if os.path.exists(ub.config.config_converterpath):
-        try:
-            p = subprocess.Popen([ub.config.config_converterpath, '--version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            p.wait()
-            for lines in p.stdout.readlines():
-                if isinstance(lines, bytes):
-                    lines = lines.decode('utf-8')
-                if re.search('ebook-convert.*\(calibre', lines):
-                    versions = lines
-        except Exception:
-            versions = _(u'Excecution permissions missing')
-    return {'Calibre converter' : versions}
+def get_calibre_version():
+    return _get_command_version(config.config_converterpath, r'ebook-convert.*\(calibre', '--version') \
+           or _NOT_CONFIGURED
 
 
-def versioncheck():
-    if ub.config.config_ebookconverter == 1:
-        return versionKindle()
-    elif ub.config.config_ebookconverter == 2:
-        return versionCalibre()
-    else:
-        return {'ebook_converter':_(u'not configured')}
+def get_unrar_version():
+    return _get_command_version(config.config_rarfile_location, r'UNRAR.*\d') or _NOT_CONFIGURED
+
+def get_kepubify_version():
+    return _get_command_version(config.config_kepubifypath, r'kepubify\s','--version') or _NOT_CONFIGURED
+
 

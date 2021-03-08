@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 #  This file is part of the Calibre-Web (https://github.com/janeczku/calibre-web)
@@ -17,11 +16,15 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+from __future__ import division, print_function, unicode_literals
+import os
 import zipfile
 from lxml import etree
-import os
-import uploader
-import isoLanguages
+
+from . import isoLanguages
+from .helper import split_authors
+from .constants import BookMeta
+
 
 
 def extractCover(zipFile, coverFile, coverpath, tmp_file_name):
@@ -62,30 +65,27 @@ def get_epub_info(tmp_file_path, original_file_name, original_file_extension):
     for s in ['title', 'description', 'creator', 'language', 'subject']:
         tmp = p.xpath('dc:%s/text()' % s, namespaces=ns)
         if len(tmp) > 0:
-            epub_metadata[s] = p.xpath('dc:%s/text()' % s, namespaces=ns)[0]
+            if s == 'creator':
+                epub_metadata[s] = ' & '.join(split_authors(tmp))
+            elif s == 'subject':
+                epub_metadata[s] = ', '.join(tmp)
+            else:
+                epub_metadata[s] = tmp[0]
         else:
-            epub_metadata[s] = "Unknown"
+            epub_metadata[s] = u'Unknown'
 
-    if epub_metadata['subject'] == "Unknown":
+    if epub_metadata['subject'] == u'Unknown':
         epub_metadata['subject'] = ''
 
-    if epub_metadata['description'] == "Unknown":
+    if epub_metadata['description'] == u'Unknown':
         description = tree.xpath("//*[local-name() = 'description']/text()")
         if len(description) > 0:
             epub_metadata['description'] = description
         else:
             epub_metadata['description'] = ""
 
-    if epub_metadata['language'] == "Unknown":
-        epub_metadata['language'] = ""
-    else:
-        lang = epub_metadata['language'].split('-', 1)[0].lower()
-        if len(lang) == 2:
-            epub_metadata['language'] = isoLanguages.get(part1=lang).name
-        elif len(lang) == 3:
-            epub_metadata['language'] = isoLanguages.get(part3=lang).name
-        else:
-            epub_metadata['language'] = ""
+    lang = epub_metadata['language'].split('-', 1)[0].lower()
+    epub_metadata['language'] = isoLanguages.get_lang3(lang)
 
     series = tree.xpath("/pkg:package/pkg:metadata/pkg:meta[@name='calibre:series']/@content", namespaces=ns)
     if len(series) > 0:
@@ -107,25 +107,32 @@ def get_epub_info(tmp_file_path, original_file_name, original_file_extension):
         meta_cover = tree.xpath("/pkg:package/pkg:metadata/pkg:meta[@name='cover']/@content", namespaces=ns)
         if len(meta_cover) > 0:
             coversection = tree.xpath("/pkg:package/pkg:manifest/pkg:item[@id='"+meta_cover[0]+"']/@href", namespaces=ns)
-            if len(coversection) > 0:
-                filetype = coversection[0].rsplit('.', 1)[-1]
-                if filetype == "xhtml" or filetype == "html":  # if cover is (x)html format
-                    markup = epubZip.read(os.path.join(coverpath, coversection[0]))
-                    markupTree = etree.fromstring(markup)
-                    # no matter xhtml or html with no namespace
-                    imgsrc = markupTree.xpath("//*[local-name() = 'img']/@src")
+        else:
+            coversection = tree.xpath("/pkg:package/pkg:guide/pkg:reference/@href", namespaces=ns)
+        if len(coversection) > 0:
+            filetype = coversection[0].rsplit('.', 1)[-1]
+            if filetype == "xhtml" or filetype == "html":  # if cover is (x)html format
+                markup = epubZip.read(os.path.join(coverpath, coversection[0]))
+                markupTree = etree.fromstring(markup)
+                # no matter xhtml or html with no namespace
+                imgsrc = markupTree.xpath("//*[local-name() = 'img']/@src")
+                # Alternative image source
+                if not len(imgsrc):
+                    imgsrc = markupTree.xpath("//attribute::*[contains(local-name(), 'href')]")
+                if len(imgsrc):
                     # imgsrc maybe startwith "../"" so fullpath join then relpath to cwd
-                    filename = os.path.relpath(os.path.join(os.path.dirname(os.path.join(coverpath, coversection[0])), imgsrc[0]))
+                    filename = os.path.relpath(os.path.join(os.path.dirname(os.path.join(coverpath, coversection[0])),
+                                                            imgsrc[0]))
                     coverfile = extractCover(epubZip, filename, "", tmp_file_path)
-                else:
-                    coverfile = extractCover(epubZip, coversection[0], coverpath, tmp_file_path)
+            else:
+                coverfile = extractCover(epubZip, coversection[0], coverpath, tmp_file_path)
 
     if not epub_metadata['title']:
         title = original_file_name
     else:
         title = epub_metadata['title']
 
-    return uploader.BookMeta(
+    return BookMeta(
         file_path=tmp_file_path,
         extension=original_file_extension,
         title=title.encode('utf-8').decode('utf-8'),

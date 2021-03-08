@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 #  This file is part of the Calibre-Web (https://github.com/janeczku/calibre-web)
@@ -17,24 +16,27 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-import threading
-import zipfile
-import requests
-import re
-import logging
-import server
-import time
-from io import BytesIO
-import os
+from __future__ import division, print_function, unicode_literals
 import sys
-import shutil
-from ub import config, UPDATE_STABLE
-from tempfile import gettempdir
+import os
 import datetime
 import json
-from flask_babel import gettext as _
+import shutil
+import threading
+import time
+import zipfile
+from io import BytesIO
+from tempfile import gettempdir
+
+import requests
 from babel.dates import format_datetime
-import web
+from flask_babel import gettext as _
+
+from . import constants, logger, config, web_server
+
+
+log = logger.create()
+_REPOSITORY_API_URL = 'https://api.github.com/repos/janeczku/calibre-web'
 
 
 def is_sha1(sha1):
@@ -51,71 +53,106 @@ class Updater(threading.Thread):
 
     def __init__(self):
         threading.Thread.__init__(self)
+        self.paused = False
+        # self.pause_cond = threading.Condition(threading.Lock())
+        self.can_run = threading.Event()
+        self.pause()
         self.status = -1
         self.updateIndex = None
+        # self.run()
 
     def get_current_version_info(self):
-        if config.get_update_channel == UPDATE_STABLE:
+        if config.config_updatechannel == constants.UPDATE_STABLE:
             return self._stable_version_info()
-        else:
-            return self._nightly_version_info()
+        return self._nightly_version_info()
 
-    def get_available_updates(self, request_method):
-        if config.get_update_channel == UPDATE_STABLE:
+    def get_available_updates(self, request_method, locale):
+        if config.config_updatechannel == constants.UPDATE_STABLE:
             return self._stable_available_updates(request_method)
-        else:
-            return self._nightly_available_updates(request_method)
+        return self._nightly_available_updates(request_method, locale)
 
-    def run(self):
+    def do_work(self):
         try:
             self.status = 1
-            r = requests.get(self._get_request_path(), stream=True)
+            log.debug(u'Download update file')
+            headers = {'Accept': 'application/vnd.github.v3+json'}
+            r = requests.get(self._get_request_path(), stream=True, headers=headers, timeout=(10, 600))
             r.raise_for_status()
 
             self.status = 2
+            log.debug(u'Opening zipfile')
             z = zipfile.ZipFile(BytesIO(r.content))
             self.status = 3
+            log.debug(u'Extracting zipfile')
             tmp_dir = gettempdir()
             z.extractall(tmp_dir)
             foldername = os.path.join(tmp_dir, z.namelist()[0])[:-1]
             if not os.path.isdir(foldername):
                 self.status = 11
-                logging.getLogger('cps.web').info(u'Extracted contents of zipfile not found in temp folder')
-                return
+                log.info(u'Extracted contents of zipfile not found in temp folder')
+                self.pause()
+                return False
             self.status = 4
-            self.update_source(foldername, config.get_main_dir)
+            log.debug(u'Replacing files')
+            self.update_source(foldername, constants.BASE_DIR)
             self.status = 6
+            log.debug(u'Preparing restart of server')
             time.sleep(2)
-            server.Server.setRestartTyp(True)
-            server.Server.stopServer()
+            web_server.stop(True)
             self.status = 7
             time.sleep(2)
+            return True
         except requests.exceptions.HTTPError as ex:
-            logging.getLogger('cps.web').info( u'HTTP Error' + ' ' + str(ex))
+            log.info(u'HTTP Error %s', ex)
             self.status = 8
         except requests.exceptions.ConnectionError:
-            logging.getLogger('cps.web').info(u'Connection error')
+            log.info(u'Connection error')
             self.status = 9
         except requests.exceptions.Timeout:
-            logging.getLogger('cps.web').info(u'Timeout while establishing connection')
+            log.info(u'Timeout while establishing connection')
             self.status = 10
-        except requests.exceptions.RequestException:
+        except (requests.exceptions.RequestException, zipfile.BadZipFile):
             self.status = 11
-            logging.getLogger('cps.web').info(u'General error')
+            log.info(u'General error')
+        except (IOError, OSError):
+            self.status = 12
+            log.info(u'Update File Could Not be Saved in Temp Dir')
+        self.pause()
+        return False
+
+    def run(self):
+        while True:
+            self.can_run.wait()
+            if self.status > -1:
+                if self.do_work():
+                    break   # stop loop and end thread for restart
+            else:
+                break
+
+    def pause(self):
+        self.can_run.clear()
+
+    # should just resume the thread
+    def resume(self):
+        self.can_run.set()
+
+    def stop(self):
+        self.status = -2
+        self.can_run.set()
 
     def get_update_status(self):
         return self.status
 
     @classmethod
-    def file_to_list(self, filelist):
+    def file_to_list(cls, filelist):
         return [x.strip() for x in open(filelist, 'r') if not x.startswith('#EXT')]
 
     @classmethod
-    def one_minus_two(self, one, two):
+    def one_minus_two(cls, one, two):
         return [x for x in one if x not in set(two)]
 
     @classmethod
-    def reduce_dirs(self, delete_files, new_list):
+    def reduce_dirs(cls, delete_files, new_list):
         new_delete = []
         for filename in delete_files:
             parts = filename.split(os.sep)
@@ -136,7 +173,7 @@ class Updater(threading.Thread):
         return list(set(new_delete))
 
     @classmethod
-    def reduce_files(self, remove_items, exclude_items):
+    def reduce_files(cls, remove_items, exclude_items):
         rf = []
         for item in remove_items:
             if not item.startswith(exclude_items):
@@ -144,19 +181,18 @@ class Updater(threading.Thread):
         return rf
 
     @classmethod
-    def moveallfiles(self, root_src_dir, root_dst_dir):
+    def moveallfiles(cls, root_src_dir, root_dst_dir):
         change_permissions = True
+        new_permissions = os.stat(root_dst_dir)
         if sys.platform == "win32" or sys.platform == "darwin":
             change_permissions = False
         else:
-            logging.getLogger('cps.web').debug('Update on OS-System : ' + sys.platform)
-            new_permissions = os.stat(root_dst_dir)
-            # print new_permissions
+            log.debug('Update on OS-System : %s', sys.platform)
         for src_dir, __, files in os.walk(root_src_dir):
             dst_dir = src_dir.replace(root_src_dir, root_dst_dir, 1)
             if not os.path.exists(dst_dir):
                 os.makedirs(dst_dir)
-                logging.getLogger('cps.web').debug('Create-Dir: '+dst_dir)
+                log.debug('Create-Dir: %s', dst_dir)
                 if change_permissions:
                     # print('Permissions: User '+str(new_permissions.st_uid)+' Group '+str(new_permissions.st_uid))
                     os.chown(dst_dir, new_permissions.st_uid, new_permissions.st_gid)
@@ -166,22 +202,21 @@ class Updater(threading.Thread):
                 if os.path.exists(dst_file):
                     if change_permissions:
                         permission = os.stat(dst_file)
-                    logging.getLogger('cps.web').debug('Remove file before copy: '+dst_file)
+                    log.debug('Remove file before copy: %s', dst_file)
                     os.remove(dst_file)
                 else:
                     if change_permissions:
                         permission = new_permissions
                 shutil.move(src_file, dst_dir)
-                logging.getLogger('cps.web').debug('Move File '+src_file+' to '+dst_dir)
+                log.debug('Move File %s to %s', src_file, dst_dir)
                 if change_permissions:
                     try:
                         os.chown(dst_file, permission.st_uid, permission.st_gid)
-                    except (Exception) as e:
-                        # ex = sys.exc_info()
+                    except OSError as e:
                         old_permissions = os.stat(dst_file)
-                        logging.getLogger('cps.web').debug('Fail change permissions of ' + str(dst_file) + '. Before: '
-                            + str(old_permissions.st_uid) + ':' + str(old_permissions.st_gid) + ' After: '
-                            + str(permission.st_uid) + ':' + str(permission.st_gid) + ' error: '+str(e))
+                        log.debug('Fail change permissions of %s. Before: %s:%s After %s:%s error: %s',
+                                  dst_file, old_permissions.st_uid, old_permissions.st_gid,
+                                  permission.st_uid, permission.st_gid, e)
         return
 
     def update_source(self, source, destination):
@@ -189,8 +224,14 @@ class Updater(threading.Thread):
         old_list = list()
         exclude = (
             os.sep + 'app.db', os.sep + 'calibre-web.log1', os.sep + 'calibre-web.log2', os.sep + 'gdrive.db',
-            os.sep + 'vendor', os.sep + 'calibre-web.log', os.sep + '.git', os.sep +'client_secrets.json',
-            os.sep + 'gdrive_credentials', os.sep + 'settings.yaml')
+            os.sep + 'vendor', os.sep + 'calibre-web.log', os.sep + '.git', os.sep + 'client_secrets.json',
+            os.sep + 'gdrive_credentials', os.sep + 'settings.yaml', os.sep + 'venv', os.sep + 'virtualenv',
+            os.sep + 'access.log', os.sep + 'access.log1', os.sep + 'access.log2',
+            os.sep + '.calibre-web.log.swp', os.sep + '_sqlite3.so'
+        )
+        additional_path = self.is_venv()
+        if additional_path:
+            exclude = exclude + (additional_path,)
         for root, dirs, files in os.walk(destination, topdown=True):
             for name in files:
                 old_list.append(os.path.join(root, name).replace(destination, ''))
@@ -215,70 +256,80 @@ class Updater(threading.Thread):
         for item in remove_items:
             item_path = os.path.join(destination, item[1:])
             if os.path.isdir(item_path):
-                logging.getLogger('cps.web').debug("Delete dir " + item_path)
+                log.debug("Delete dir %s", item_path)
                 shutil.rmtree(item_path, ignore_errors=True)
             else:
                 try:
-                    logging.getLogger('cps.web').debug("Delete file " + item_path)
+                    log.debug("Delete file %s", item_path)
                     # log_from_thread("Delete file " + item_path)
                     os.remove(item_path)
-                except Exception:
-                    logging.getLogger('cps.web').debug("Could not remove:" + item_path)
+                except OSError:
+                    log.debug("Could not remove: %s", item_path)
         shutil.rmtree(source, ignore_errors=True)
 
-    def _nightly_version_info(self):
-        content = {}
-        content[0] = '$Format:%H$'
-        content[1] = '$Format:%cI$'
-        # content[0] = 'bb7d2c6273ae4560e83950d36d64533343623a57'
-        # content[1] = '2018-09-09T10:13:08+02:00'
-        if is_sha1(content[0]) and len(content[1]) > 0:
-            return {'version': content[0], 'datetime': content[1]}
+    def is_venv(self):
+        if (hasattr(sys, 'real_prefix')) or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
+            return os.sep + os.path.relpath(sys.prefix, constants.BASE_DIR)
+        else:
+            return False
+
+    @classmethod
+    def _nightly_version_info(cls):
+        if is_sha1(constants.NIGHTLY_VERSION[0]) and len(constants.NIGHTLY_VERSION[1]) > 0:
+            return {'version': constants.NIGHTLY_VERSION[0], 'datetime': constants.NIGHTLY_VERSION[1]}
         return False
 
-    def _stable_version_info(self):
-        return {'version': '0.6.4 Beta'} # Current version
+    @classmethod
+    def _stable_version_info(cls):
+        return constants.STABLE_VERSION  # Current version
 
-    def _nightly_available_updates(self, request_method):
+    def _nightly_available_updates(self, request_method, locale):
         tz = datetime.timedelta(seconds=time.timezone if (time.localtime().tm_isdst == 0) else time.altzone)
         if request_method == "GET":
-            repository_url = 'https://api.github.com/repos/janeczku/calibre-web'
-            status, commit = self._load_remote_data(repository_url +'/git/refs/heads/master')
+            repository_url = _REPOSITORY_API_URL
+            status, commit = self._load_remote_data(repository_url + '/git/refs/heads/master')
             parents = []
             if status['message'] != '':
                 return json.dumps(status)
-            if 'object' not in commit:
+            if 'object' not in commit or 'url' not in commit['object']:
                 status['message'] = _(u'Unexpected data while reading update information')
                 return json.dumps(status)
-
-            if commit['object']['sha'] == status['current_commit_hash']:
-                status.update({
-                    'update': False,
-                    'success': True,
-                    'message': _(u'No update available. You already have the latest version installed')
-                })
+            try:
+                if commit['object']['sha'] == status['current_commit_hash']:
+                    status.update({
+                        'update': False,
+                        'success': True,
+                        'message': _(u'No update available. You already have the latest version installed')
+                    })
+                    return json.dumps(status)
+            except (TypeError, KeyError):
+                status['message'] = _(u'Unexpected data while reading update information')
                 return json.dumps(status)
 
             # a new update is available
             status['update'] = True
 
             try:
-                r = requests.get(repository_url + '/git/commits/' + commit['object']['sha'])
+                headers = {'Accept': 'application/vnd.github.v3+json'}
+                r = requests.get(repository_url + '/git/commits/' + commit['object']['sha'],
+                                 headers=headers,
+                                 timeout=10)
                 r.raise_for_status()
                 update_data = r.json()
             except requests.exceptions.HTTPError as e:
-                status['error'] = _(u'HTTP Error') + ' ' + str(e)
+                status['message'] = _(u'HTTP Error') + ' ' + str(e)
             except requests.exceptions.ConnectionError:
-                status['error'] = _(u'Connection error')
+                status['message'] = _(u'Connection error')
             except requests.exceptions.Timeout:
-                status['error'] = _(u'Timeout while establishing connection')
-            except requests.exceptions.RequestException:
-                status['error'] = _(u'General error')
+                status['message'] = _(u'Timeout while establishing connection')
+            except (requests.exceptions.RequestException, ValueError):
+                status['message'] = _(u'General error')
 
             if status['message'] != '':
                 return json.dumps(status)
 
-            if 'committer' in update_data and 'message' in update_data:
+            # if 'committer' in update_data and 'message' in update_data:
+            try:
                 status['success'] = True
                 status['message'] = _(
                     u'A new update is available. Click on the button below to update to the latest version.')
@@ -287,19 +338,18 @@ class Updater(threading.Thread):
                     update_data['committer']['date'], '%Y-%m-%dT%H:%M:%SZ') - tz
                 parents.append(
                     [
-                        format_datetime(new_commit_date, format='short', locale=web.get_locale()),
+                        format_datetime(new_commit_date, format='short', locale=locale),
                         update_data['message'],
                         update_data['sha']
                     ]
                 )
-
                 # it only makes sense to analyze the parents if we know the current commit hash
                 if status['current_commit_hash'] != '':
                     try:
                         parent_commit = update_data['parents'][0]
                         # limit the maximum search depth
                         remaining_parents_cnt = 10
-                    except IndexError:
+                    except (IndexError, KeyError):
                         remaining_parents_cnt = None
 
                     if remaining_parents_cnt is not None:
@@ -310,17 +360,18 @@ class Updater(threading.Thread):
                             # check if we are more than one update behind if so, go up the tree
                             if parent_commit['sha'] != status['current_commit_hash']:
                                 try:
-                                    r = requests.get(parent_commit['url'])
+                                    headers = {'Accept': 'application/vnd.github.v3+json'}
+                                    r = requests.get(parent_commit['url'], headers=headers, timeout=10)
                                     r.raise_for_status()
                                     parent_data = r.json()
 
                                     parent_commit_date = datetime.datetime.strptime(
                                         parent_data['committer']['date'], '%Y-%m-%dT%H:%M:%SZ') - tz
                                     parent_commit_date = format_datetime(
-                                        parent_commit_date, format='short', locale=web.get_locale())
+                                        parent_commit_date, format='short', locale=locale)
 
                                     parents.append([parent_commit_date,
-                                                    parent_data['message'].replace('\r\n','<p>').replace('\n','<p>')])
+                                                    parent_data['message'].replace('\r\n', '<p>').replace('\n', '<p>')])
                                     parent_commit = parent_data['parents'][0]
                                     remaining_parents_cnt -= 1
                                 except Exception:
@@ -329,64 +380,10 @@ class Updater(threading.Thread):
                             else:
                                 # parent is our current version
                                 break
-
-            else:
+                status['history'] = parents[::-1]
+            except (IndexError, KeyError):
                 status['success'] = False
                 status['message'] = _(u'Could not fetch update information')
-
-            # a new update is available
-            status['update'] = True
-            if 'body' in commit:
-                status['success'] = True
-                status['message'] = _(
-                    u'A new update is available. Click on the button below to update to the latest version.')
-
-                new_commit_date = datetime.datetime.strptime(
-                    commit['committer']['date'], '%Y-%m-%dT%H:%M:%SZ') - tz
-                parents.append(
-                    [
-                        format_datetime(new_commit_date, format='short', locale=web.get_locale()),
-                        commit['message'],
-                        commit['sha']
-                    ]
-                )
-
-                # it only makes sense to analyze the parents if we know the current commit hash
-                if status['current_commit_hash'] != '':
-                    try:
-                        parent_commit = commit['parents'][0]
-                        # limit the maximum search depth
-                        remaining_parents_cnt = 10
-                    except IndexError:
-                        remaining_parents_cnt = None
-
-                    if remaining_parents_cnt is not None:
-                        while True:
-                            if remaining_parents_cnt == 0:
-                                break
-
-                            # check if we are more than one update behind if so, go up the tree
-                            if commit['sha'] != status['current_commit_hash']:
-                                try:
-                                    r = requests.get(parent_commit['url'])
-                                    r.raise_for_status()
-                                    parent_data = r.json()
-
-                                    parent_commit_date = datetime.datetime.strptime(
-                                        parent_data['committer']['date'], '%Y-%m-%dT%H:%M:%SZ') - tz
-                                    parent_commit_date = format_datetime(
-                                        parent_commit_date, format='short', locale=web.get_locale())
-
-                                    parents.append([parent_commit_date, parent_data['message'], parent_data['sha']])
-                                    parent_commit = parent_data['parents'][0]
-                                    remaining_parents_cnt -= 1
-                                except Exception:
-                                    # it isn't crucial if we can't get information about the parent
-                                    break
-                            else:
-                                # parent is our current version
-                                break
-            status['history'] = parents[::-1]
             return json.dumps(status)
         return ''
 
@@ -394,7 +391,7 @@ class Updater(threading.Thread):
         if request_method == "GET":
             parents = []
             # repository_url = 'https://api.github.com/repos/flatpak/flatpak/releases'  # test URL
-            repository_url = 'https://api.github.com/repos/janeczku/calibre-web/releases'
+            repository_url = _REPOSITORY_API_URL + '/releases?per_page=100'
             status, commit = self._load_remote_data(repository_url)
             if status['message'] != '':
                 return json.dumps(status)
@@ -418,8 +415,9 @@ class Updater(threading.Thread):
                 return json.dumps(status)
 
             i = len(commit) - 1
+            newer = False
             while i >= 0:
-                if 'tag_name' not in commit[i] or 'body' not in commit[i]:
+                if 'tag_name' not in commit[i] or 'body' not in commit[i] or 'zipball_url' not in commit[i]:
                     status['message'] = _(u'Unexpected data while reading update information')
                     return json.dumps(status)
                 major_version_update = int(commit[i]['tag_name'].split('.')[0])
@@ -433,12 +431,13 @@ class Updater(threading.Thread):
                 except ValueError:
                     current_version[2] = int(current_version[2].split(' ')[0])-1
 
-                # Check if major versions are identical search for newest nonenqual commit and update to this one
+                # Check if major versions are identical search for newest non equal commit and update to this one
                 if major_version_update == current_version[0]:
                     if (minor_version_update == current_version[1] and
                             patch_version_update > current_version[2]) or \
                             minor_version_update > current_version[1]:
-                        parents.append([commit[i]['tag_name'],commit[i]['body'].replace('\r\n', '<p>')])
+                        parents.append([commit[i]['tag_name'], commit[i]['body'].replace('\r\n', '<p>')])
+                        newer = True
                     i -= 1
                     continue
                 if major_version_update < current_version[0]:
@@ -447,7 +446,9 @@ class Updater(threading.Thread):
                 if major_version_update > current_version[0]:
                     # found update update to last version before major update, unless current version is on last version
                     # before major update
-                    if commit[i+1]['tag_name'].split('.')[1] == current_version[1]:
+                    if i == (len(commit) - 1):
+                        i -= 1
+                    if int(commit[i+1]['tag_name'].split('.')[1]) == current_version[1]:
                         parents.append([commit[i]['tag_name'],
                                         commit[i]['body'].replace('\r\n', '<p>').replace('\n', '<p>')])
                         status.update({
@@ -459,16 +460,18 @@ class Updater(threading.Thread):
                         })
                         self.updateFile = commit[i]['zipball_url']
                     else:
+                        parents.append([commit[i+1]['tag_name'],
+                                        commit[i+1]['body'].replace('\r\n', '<p>').replace('\n', '<p>')])
                         status.update({
                             'update': True,
                             'success': True,
                             'message': _(u'A new update is available. Click on the button below to '
-                                         u'update to version: %(version)s', version=commit[i]['tag_name']),
+                                         u'update to version: %(version)s', version=commit[i+1]['tag_name']),
                             'history': parents
                         })
-                        self.updateFile = commit[i +1]['zipball_url']
+                        self.updateFile = commit[i+1]['zipball_url']
                     break
-            if i == -1:
+            if i == -1 and newer == False:
                 status.update({
                     'update': True,
                     'success': True,
@@ -477,13 +480,22 @@ class Updater(threading.Thread):
                     'history': parents
                 })
                 self.updateFile = commit[0]['zipball_url']
+            elif i == -1 and newer == True:
+                status.update({
+                    'update': True,
+                    'success': True,
+                    'message': _(u'A new update is available. Click on the button below to '
+                                 u'update to version: %(version)s', version=commit[0]['tag_name']),
+                    'history': parents
+                })
+                self.updateFile = commit[0]['zipball_url']
+
         return json.dumps(status)
 
     def _get_request_path(self):
-        if config.get_update_channel == UPDATE_STABLE:
+        if config.config_updatechannel == constants.UPDATE_STABLE:
             return self.updateFile
-        else:
-            return 'https://api.github.com/repos/janeczku/calibre-web/zipball/master'
+        return _REPOSITORY_API_URL + '/zipball/master'
 
     def _load_remote_data(self, repository_url):
         status = {
@@ -499,7 +511,8 @@ class Updater(threading.Thread):
         else:
             status['current_commit_hash'] = version['version']
         try:
-            r = requests.get(repository_url)
+            headers = {'Accept': 'application/vnd.github.v3+json'}
+            r = requests.get(repository_url, headers=headers, timeout=10)
             commit = r.json()
             r.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -512,10 +525,7 @@ class Updater(threading.Thread):
             status['message'] = _(u'Connection error')
         except requests.exceptions.Timeout:
             status['message'] = _(u'Timeout while establishing connection')
-        except requests.exceptions.RequestException:
+        except (requests.exceptions.RequestException, ValueError):
             status['message'] = _(u'General error')
-
+        log.debug('Updater status: %s', status['message'])
         return status, commit
-
-
-updater_thread = Updater()
